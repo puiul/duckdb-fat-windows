@@ -12,7 +12,7 @@ on:
       extensions:
         description: "Semicolon-separated extension list to link in"
         required: true
-        default: "autocomplete;icu;json;excel;httpfs;iceberg;sqlite;ducklake;encodings;fts;inet"
+        default: "autocomplete;icu;json;excel;httpfs;iceberg;sqlite_scanner;ducklake;encodings;fts;inet"
 
 jobs:
   build:
@@ -32,6 +32,39 @@ jobs:
       - name: Enable long paths for git
         shell: pwsh
         run: git config --system core.longpaths true
+
+      # vcpkg builds the AWS SDK and OpenSSL from source (~20 min); keep the
+      # compiled packages between runs.
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-${{ runner.os }}-${{ inputs.duckdb_ref }}-${{ hashFiles('.github/config/extensions/*.cmake') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ inputs.duckdb_ref }}-
+            vcpkg-${{ runner.os }}-
+
+      # Some of DuckDB's per-extension configs (fts, encodings at v1.5.5) carry
+      # DONT_LINK, which yields a loadable file instead of linking into the EXE.
+      # Copy those entries, minus the flag, into extension_config_local.cmake,
+      # which DuckDB reads first and which overrides the stock entry.
+      - name: Force static linking for extensions marked DONT_LINK
+        shell: pwsh
+        run: |
+          $out = @()
+          foreach ($ext in "${{ inputs.extensions }}".Split(';', [StringSplitOptions]::RemoveEmptyEntries)) {
+            $cfg = ".github/config/extensions/$ext.cmake"
+            if ((Test-Path $cfg) -and (Select-String -Path $cfg -Pattern 'DONT_LINK' -Quiet)) {
+              Write-Host "Overriding DONT_LINK for $ext"
+              $out += (Get-Content $cfg -Raw) -replace '\bDONT_LINK\b', ''
+            }
+          }
+          if ($out.Count -gt 0) {
+            Set-Content -Path extension/extension_config_local.cmake -Value ($out -join "`n")
+            Get-Content extension/extension_config_local.cmake
+          } else {
+            Write-Host "No DONT_LINK overrides needed"
+          }
 
       # Phase 1: DuckDB's "extension configuration" build. It resolves the
       # out-of-tree extensions (excel, httpfs, iceberg live in their own repos,
