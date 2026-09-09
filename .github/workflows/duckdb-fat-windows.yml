@@ -34,9 +34,11 @@ jobs:
         run: git config --system core.longpaths true
 
       # vcpkg builds the AWS SDK and OpenSSL from source (~20 min); keep the
-      # compiled packages between runs.
-      - name: Cache vcpkg binary packages
-        uses: actions/cache@v4
+      # compiled packages between runs. Restore here, save at the end
+      # regardless of job outcome (plain actions/cache only saves on success).
+      - name: Restore vcpkg binary packages
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/AppData/Local/vcpkg/archives
           key: vcpkg-${{ runner.os }}-${{ inputs.duckdb_ref }}-${{ hashFiles('.github/config/extensions/*.cmake') }}
@@ -47,8 +49,10 @@ jobs:
       # Some of DuckDB's per-extension configs (fts, encodings, sqlite_scanner on
       # Windows at v1.5.5) carry DONT_LINK, which yields a loadable file instead
       # of linking into the EXE. DuckDB includes these files directly, so strip
-      # the flag in place. Note: sqlite_scanner's file says static linking on
-      # Windows has symbol collisions; if the link fails, drop it from the list.
+      # the flag in place. Linked extensions also need INCLUDE_DIR so the
+      # generated loader can find <name>_extension.hpp; DONT_LINK configs omit it.
+      # Note: sqlite_scanner's file says static linking on Windows has symbol
+      # collisions; if the link fails, drop it from the list.
       - name: Strip DONT_LINK from extension configs
         shell: pwsh
         run: |
@@ -56,7 +60,11 @@ jobs:
             $cfg = ".github/config/extensions/$ext.cmake"
             if ((Test-Path $cfg) -and (Select-String -Path $cfg -Pattern 'DONT_LINK' -Quiet)) {
               Write-Host "Stripping DONT_LINK from $cfg"
-              (Get-Content $cfg -Raw) -replace '\bDONT_LINK\b', '' | Set-Content -Path $cfg -NoNewline
+              $txt = (Get-Content $cfg -Raw) -replace '\bDONT_LINK\b', ''
+              if ($txt -notmatch 'INCLUDE_DIR') {
+                $txt = $txt -replace '(\s+)GIT_URL', '$1INCLUDE_DIR src/include$1GIT_URL'
+              }
+              $txt | Set-Content -Path $cfg -NoNewline
               Get-Content $cfg
             }
           }
@@ -79,7 +87,8 @@ jobs:
           Get-ChildItem
 
       # Phase 2: real configure. vcpkg (preinstalled on the runner) installs the
-      # merged dependencies (OpenSSL for httpfs, etc.) in manifest mode.
+      # merged dependencies (OpenSSL for httpfs, AWS SDK for iceberg, etc.) in
+      # manifest mode.
       - name: Configure
         shell: pwsh
         run: |
@@ -125,6 +134,13 @@ jobs:
           & dist/duckdb.exe -c "SELECT extension_name, loaded, installed, install_mode FROM duckdb_extensions() WHERE extension_name IN ('parquet','core_functions','autocomplete','icu','json','excel','httpfs','iceberg','sqlite_scanner','ducklake','encodings','fts','inet') ORDER BY extension_name"
           Write-Host "`n== loaded extensions"
           & dist/duckdb.exe -c "SELECT extension_name, install_mode FROM duckdb_extensions() WHERE loaded ORDER BY extension_name"
+
+      - name: Save vcpkg binary packages
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
 
       - name: Upload duckdb.exe
         if: always()
