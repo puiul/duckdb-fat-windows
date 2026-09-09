@@ -1,0 +1,87 @@
+# Builds duckdb.exe for windows_amd64 with the listed extensions statically linked.
+# Runs only on manual trigger (Actions tab -> "Run workflow").
+name: duckdb-fat-windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      duckdb_ref:
+        description: "DuckDB git tag to build (see https://github.com/duckdb/duckdb/releases)"
+        required: true
+        default: "v1.4.4"
+      extensions:
+        description: "Semicolon-separated extension list to link in"
+        required: true
+        default: "autocomplete;icu;json;excel;httpfs;iceberg"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out DuckDB source at the requested tag
+        uses: actions/checkout@v4
+        with:
+          repository: duckdb/duckdb
+          ref: ${{ inputs.duckdb_ref }}
+          fetch-depth: 0   # git describe needs the tags
+
+      # Phase 1: DuckDB's "extension configuration" build. It resolves the
+      # out-of-tree extensions (excel, httpfs, iceberg live in their own repos,
+      # pinned per DuckDB release under .github/config/extensions/) and merges
+      # their vcpkg.json dependency manifests into one.
+      - name: Merge extension vcpkg manifests
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/extension_configuration | Out-Null
+          Set-Location build/extension_configuration
+          cmake -DEXTENSION_CONFIG_BUILD=TRUE `
+                -DCORE_EXTENSIONS="${{ inputs.extensions }}" `
+                -DCMAKE_BUILD_TYPE=Release `
+                -DCMAKE_GENERATOR_PLATFORM=x64 `
+                ../..
+          cmake --build . --config Release
+          Get-ChildItem
+
+      # Phase 2: real configure. vcpkg (preinstalled on the runner) installs the
+      # merged dependencies (OpenSSL for httpfs, etc.) in manifest mode.
+      - name: Configure
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/release | Out-Null
+          Set-Location build/release
+          cmake -DCMAKE_BUILD_TYPE=Release `
+                -DCMAKE_GENERATOR_PLATFORM=x64 `
+                -DBUILD_SHELL=TRUE `
+                -DBUILD_UNITTESTS=FALSE `
+                -DBUILD_BENCHMARKS=FALSE `
+                -DEXTENSION_STATIC_BUILD=TRUE `
+                -DCORE_EXTENSIONS="${{ inputs.extensions }}" `
+                -DVCPKG_BUILD=1 `
+                -DVCPKG_MANIFEST_DIR="$env:GITHUB_WORKSPACE/build/extension_configuration" `
+                -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+                -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+                ../..
+
+      - name: Build the CLI
+        shell: pwsh
+        run: cmake --build build/release --config Release --target shell --parallel 4
+
+      - name: Locate and smoke-test the binary
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path build/release -Recurse -Filter duckdb.exe | Select-Object -First 1
+          if (-not $exe) { throw "duckdb.exe not found" }
+          Write-Host "Binary: $($exe.FullName) ($([math]::Round($exe.Length/1MB,1)) MB)"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $exe.FullName dist/duckdb.exe
+          & dist/duckdb.exe -c "SELECT extension_name, install_mode FROM duckdb_extensions() WHERE loaded ORDER BY 1"
+          & dist/duckdb.exe -c "SELECT version()"
+
+      - name: Upload duckdb.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-windows-amd64-static-${{ inputs.duckdb_ref }}
+          path: dist/duckdb.exe
+          if-no-files-found: error
