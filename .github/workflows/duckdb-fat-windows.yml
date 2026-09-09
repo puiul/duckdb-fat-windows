@@ -12,7 +12,7 @@ on:
       extensions:
         description: "Semicolon-separated extension list to link in"
         required: true
-        default: "autocomplete;icu;json;excel;httpfs;iceberg;sqlite_scanner;ducklake;encodings;fts;inet"
+        default: "autocomplete;icu;json;excel;httpfs;iceberg;ducklake;inet"
 
 jobs:
   build:
