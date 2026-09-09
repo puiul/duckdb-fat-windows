@@ -8,11 +8,11 @@ on:
       duckdb_ref:
         description: "DuckDB git tag to build (see https://github.com/duckdb/duckdb/releases)"
         required: true
-        default: "v1.4.4"
+        default: "v1.5.5"
       extensions:
         description: "Semicolon-separated extension list to link in"
         required: true
-        default: "autocomplete;icu;json;excel;httpfs;iceberg"
+        default: "autocomplete;icu;json;excel;httpfs;iceberg;sqlite;ducklake;encodings;fts;inet"
 
 jobs:
   build:
@@ -27,6 +27,12 @@ jobs:
           ref: ${{ inputs.duckdb_ref }}
           fetch-depth: 0   # git describe needs the tags
 
+      # duckdb-iceberg ships test data with paths beyond Windows' 260-char
+      # default; git refuses to write them unless long paths are enabled.
+      - name: Enable long paths for git
+        shell: pwsh
+        run: git config --system core.longpaths true
+
       # Phase 1: DuckDB's "extension configuration" build. It resolves the
       # out-of-tree extensions (excel, httpfs, iceberg live in their own repos,
       # pinned per DuckDB release under .github/config/extensions/) and merges
@@ -37,7 +43,7 @@ jobs:
           New-Item -ItemType Directory -Force build/extension_configuration | Out-Null
           Set-Location build/extension_configuration
           cmake -DEXTENSION_CONFIG_BUILD=TRUE `
-                -DCORE_EXTENSIONS="${{ inputs.extensions }}" `
+                -DBUILD_EXTENSIONS="${{ inputs.extensions }}" `
                 -DCMAKE_BUILD_TYPE=Release `
                 -DCMAKE_GENERATOR_PLATFORM=x64 `
                 ../..
@@ -57,7 +63,7 @@ jobs:
                 -DBUILD_UNITTESTS=FALSE `
                 -DBUILD_BENCHMARKS=FALSE `
                 -DEXTENSION_STATIC_BUILD=TRUE `
-                -DCORE_EXTENSIONS="${{ inputs.extensions }}" `
+                -DBUILD_EXTENSIONS="${{ inputs.extensions }}" `
                 -DVCPKG_BUILD=1 `
                 -DVCPKG_MANIFEST_DIR="$env:GITHUB_WORKSPACE/build/extension_configuration" `
                 -DVCPKG_TARGET_TRIPLET=x64-windows-static `
