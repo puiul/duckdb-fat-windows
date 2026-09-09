@@ -106,6 +106,33 @@ jobs:
                 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
                 ../..
 
+      # The generated extension loader includes <name>_extension.hpp. Older
+      # extensions (fts, encodings, sqlite_scanner) may ship the header under a
+      # different name; list what is there and shim the expected name if needed.
+      - name: Inspect and shim extension headers
+        shell: pwsh
+        run: |
+          foreach ($ext in "${{ inputs.extensions }}".Split(';', [StringSplitOptions]::RemoveEmptyEntries)) {
+            $src = "build/release/_deps/${ext}_extension_fc-src"
+            if (-not (Test-Path $src)) { continue }   # in-tree extension
+            $inc = Join-Path $src "src/include"
+            Write-Host "== $ext headers under src/include:"
+            if (Test-Path $inc) {
+              Get-ChildItem -Path $inc -Recurse -Filter *.hpp | ForEach-Object { "   " + $_.FullName.Substring((Resolve-Path $inc).Path.Length + 1) }
+            } else { Write-Host "   (no src/include directory)" }
+            $want = Join-Path $inc "${ext}_extension.hpp"
+            if (-not (Test-Path $want)) {
+              $alt = Get-ChildItem -Path $src -Recurse -Filter "${ext}-extension.hpp" | Select-Object -First 1
+              if ($alt) {
+                New-Item -ItemType Directory -Force $inc | Out-Null
+                Set-Content -Path $want -Value "#pragma once`n#include `"$($alt.Name)`"`n"
+                Write-Host "   shim written: ${ext}_extension.hpp -> $($alt.Name)"
+              } else {
+                Write-Host "   WARNING: no ${ext}_extension.hpp and no ${ext}-extension.hpp found; link of $ext will fail"
+              }
+            }
+          }
+
       - name: Build the CLI
         shell: pwsh
         run: cmake --build build/release --config Release --target shell --parallel 4
