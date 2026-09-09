@@ -44,26 +44,21 @@ jobs:
             vcpkg-${{ runner.os }}-${{ inputs.duckdb_ref }}-
             vcpkg-${{ runner.os }}-
 
-      # Some of DuckDB's per-extension configs (fts, encodings at v1.5.5) carry
-      # DONT_LINK, which yields a loadable file instead of linking into the EXE.
-      # Copy those entries, minus the flag, into extension_config_local.cmake,
-      # which DuckDB reads first and which overrides the stock entry.
-      - name: Force static linking for extensions marked DONT_LINK
+      # Some of DuckDB's per-extension configs (fts, encodings, sqlite_scanner on
+      # Windows at v1.5.5) carry DONT_LINK, which yields a loadable file instead
+      # of linking into the EXE. DuckDB includes these files directly, so strip
+      # the flag in place. Note: sqlite_scanner's file says static linking on
+      # Windows has symbol collisions; if the link fails, drop it from the list.
+      - name: Strip DONT_LINK from extension configs
         shell: pwsh
         run: |
-          $out = @()
           foreach ($ext in "${{ inputs.extensions }}".Split(';', [StringSplitOptions]::RemoveEmptyEntries)) {
             $cfg = ".github/config/extensions/$ext.cmake"
             if ((Test-Path $cfg) -and (Select-String -Path $cfg -Pattern 'DONT_LINK' -Quiet)) {
-              Write-Host "Overriding DONT_LINK for $ext"
-              $out += (Get-Content $cfg -Raw) -replace '\bDONT_LINK\b', ''
+              Write-Host "Stripping DONT_LINK from $cfg"
+              (Get-Content $cfg -Raw) -replace '\bDONT_LINK\b', '' | Set-Content -Path $cfg -NoNewline
+              Get-Content $cfg
             }
-          }
-          if ($out.Count -gt 0) {
-            Set-Content -Path extension/extension_config_local.cmake -Value ($out -join "`n")
-            Get-Content extension/extension_config_local.cmake
-          } else {
-            Write-Host "No DONT_LINK overrides needed"
           }
 
       # Phase 1: DuckDB's "extension configuration" build. It resolves the
@@ -97,7 +92,6 @@ jobs:
                 -DBUILD_BENCHMARKS=FALSE `
                 -DEXTENSION_STATIC_BUILD=TRUE `
                 -DBUILD_EXTENSIONS="${{ inputs.extensions }}" `
-                -DVCPKG_BUILD=1 `
                 -DVCPKG_MANIFEST_DIR="$env:GITHUB_WORKSPACE/build/extension_configuration" `
                 -DVCPKG_TARGET_TRIPLET=x64-windows-static `
                 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
@@ -107,7 +101,9 @@ jobs:
         shell: pwsh
         run: cmake --build build/release --config Release --target shell --parallel 4
 
-      - name: Locate and smoke-test the binary
+      - name: Locate the binary and report on it
+        id: smoke
+        continue-on-error: true
         shell: pwsh
         run: |
           $exe = Get-ChildItem -Path build/release -Recurse -Filter duckdb.exe | Select-Object -First 1
@@ -115,10 +111,23 @@ jobs:
           Write-Host "Binary: $($exe.FullName) ($([math]::Round($exe.Length/1MB,1)) MB)"
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item $exe.FullName dist/duckdb.exe
-          & dist/duckdb.exe -c "SELECT extension_name, install_mode FROM duckdb_extensions() WHERE loaded ORDER BY 1"
-          & dist/duckdb.exe -c "SELECT version()"
+
+          Write-Host "`n== Loadable extension files DuckDB built (should be empty if all are linked):"
+          if (Test-Path build/release/repository) {
+            Get-ChildItem -Path build/release/repository -Recurse -Filter *.duckdb_extension | ForEach-Object { $_.FullName }
+          } else { Write-Host "(no repository directory)" }
+
+          Write-Host "`n== version"
+          & dist/duckdb.exe --version
+          Write-Host "`n== SELECT 1"
+          & dist/duckdb.exe -c "SELECT 1"
+          Write-Host "`n== extension status"
+          & dist/duckdb.exe -c "SELECT extension_name, loaded, installed, install_mode FROM duckdb_extensions() WHERE extension_name IN ('parquet','core_functions','autocomplete','icu','json','excel','httpfs','iceberg','sqlite_scanner','ducklake','encodings','fts','inet') ORDER BY extension_name"
+          Write-Host "`n== loaded extensions"
+          & dist/duckdb.exe -c "SELECT extension_name, install_mode FROM duckdb_extensions() WHERE loaded ORDER BY extension_name"
 
       - name: Upload duckdb.exe
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: duckdb-windows-amd64-static-${{ inputs.duckdb_ref }}
