@@ -12,11 +12,15 @@ on:
       extensions:
         description: "Semicolon-separated extension list to link in"
         required: true
-        default: "parquet;core_functions;autocomplete;icu;json;excel;httpfs;iceberg;ducklake;inet"
+        default: "parquet;core_functions;avro;autocomplete;icu;json;excel;httpfs;iceberg;ducklake;inet"
 
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write      # for the provenance attestation
+      attestations: write
     env:
       # Explicit folder so the cache action and vcpkg agree on the path
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-bincache
@@ -183,3 +187,11 @@ jobs:
           name: duckdb-windows-amd64-static-${{ inputs.duckdb_ref }}
           path: dist/duckdb.exe
           if-no-files-found: error
+
+      # Signed provenance (SLSA) linking the EXE to this repo, commit and run.
+      # Verify later with: gh attestation verify duckdb.exe --owner <github user>
+      - name: Attest build provenance
+        if: success()
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/duckdb.exe
