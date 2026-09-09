@@ -12,11 +12,14 @@ on:
       extensions:
         description: "Semicolon-separated extension list to link in"
         required: true
-        default: "autocomplete;icu;json;excel;httpfs;iceberg;ducklake;inet"
+        default: "parquet;core_functions;autocomplete;icu;json;excel;httpfs;iceberg;ducklake;inet"
 
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Explicit folder so the cache action and vcpkg agree on the path
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-bincache
     timeout-minutes: 180
 
     steps:
@@ -40,11 +43,15 @@ jobs:
         id: vcpkg-cache
         uses: actions/cache/restore@v4
         with:
-          path: ~/AppData/Local/vcpkg/archives
+          path: vcpkg-bincache
           key: vcpkg-${{ runner.os }}-${{ inputs.duckdb_ref }}-${{ hashFiles('.github/config/extensions/*.cmake') }}
           restore-keys: |
             vcpkg-${{ runner.os }}-${{ inputs.duckdb_ref }}-
             vcpkg-${{ runner.os }}-
+
+      - name: Ensure vcpkg cache folder exists
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
 
       # Some of DuckDB's per-extension configs (fts, encodings, sqlite_scanner on
       # Windows at v1.5.5) carry DONT_LINK, which yields a loadable file instead
@@ -166,7 +173,7 @@ jobs:
         if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: ~/AppData/Local/vcpkg/archives
+          path: vcpkg-bincache
           key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
 
       - name: Upload duckdb.exe
