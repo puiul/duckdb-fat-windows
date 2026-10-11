@@ -38,29 +38,46 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # Findings are also emitted as annotations, readable via the
+          # check-runs API without access to the raw log.
+          function Note([string]$title, [string]$msg) {
+            $m = ($msg -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
+            Write-Output "::notice title=${title}::$m"
+          }
+          trap {
+            $m = ("$_" -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
+            Write-Output "::error title=Verify failed::$m"
+            exit 1
+          }
           $exe = "dist/duckdb.exe"
+          Note 'files' ((Get-ChildItem -Recurse dist | ForEach-Object { "$($_.FullName) $($_.Length)" }) -join "`n")
           $expected = @('autocomplete','avro','core_functions','ducklake','excel','httpfs',
                         'iceberg','icu','inet','json','parquet','shell')
 
-          $version = (& $exe --version) -join "`n"
-          if ($LASTEXITCODE -ne 0) { throw "--version failed: $version" }
+          $version = (& $exe --version 2>&1) -join "`n"
+          Note 'version' $version
+          if ($LASTEXITCODE -ne 0) { throw "--version failed (exit $LASTEXITCODE): $version" }
 
-          $table = (& $exe -c "SELECT extension_name, install_mode FROM duckdb_extensions() WHERE loaded ORDER BY 1") -join "`n"
+          $table = (& $exe -c "SELECT extension_name, install_mode FROM duckdb_extensions() WHERE loaded ORDER BY 1" 2>&1) -join "`n"
+          Note 'loaded extensions' $table
           if ($LASTEXITCODE -ne 0) { throw "extension query failed: $table" }
 
-          $linked = & $exe -csv -noheader -c "SELECT extension_name FROM duckdb_extensions() WHERE loaded AND install_mode = 'STATICALLY_LINKED' ORDER BY 1"
-          if ($LASTEXITCODE -ne 0) { throw "linked-extension query failed" }
+          $linked = & $exe -csv -noheader -c "SELECT extension_name FROM duckdb_extensions() WHERE loaded AND install_mode = 'STATICALLY_LINKED' ORDER BY 1" 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "linked-extension query failed: $($linked -join ' ')" }
           $missing = $expected | Where-Object { $_ -notin $linked }
           if ($missing) { throw "Not statically linked: $($missing -join ', ')" }
 
-          $https = (& $exe -c "SELECT count(*) AS rows FROM read_csv('https://raw.githubusercontent.com/duckdb/duckdb/v1.5.5/data/csv/aws_locations.csv')") -join "`n"
+          $https = (& $exe -c "SELECT count(*) AS rows FROM read_csv('https://raw.githubusercontent.com/duckdb/duckdb/v1.5.5/data/csv/aws_locations.csv')" 2>&1) -join "`n"
+          Note 'https' $https
           if ($LASTEXITCODE -ne 0) { throw "HTTPS read failed: $https" }
 
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
           $size = (Get-Item $exe).Length
+          Note 'sha256' "$hash ($size bytes)"
 
-          gh attestation verify $exe --owner "${{ github.repository_owner }}" --repo "${{ github.repository }}"
-          if ($LASTEXITCODE -ne 0) { throw "attestation verification failed" }
+          $att = (gh attestation verify $exe --owner "${{ github.repository_owner }}" 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "attestation verification failed: $att" }
+          Note 'attestation' 'verified'
 
           $fence = '```'
           @"
