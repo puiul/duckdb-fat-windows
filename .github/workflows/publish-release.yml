@@ -75,6 +75,11 @@ jobs:
           $size = (Get-Item $exe).Length
           Note 'sha256' "$hash ($size bytes)"
 
+          # Autoloading on (installed extensions load on first use), autoinstall off.
+          $settings = (& $exe -csv -noheader -c "SELECT current_setting('autoload_known_extensions'), current_setting('autoinstall_known_extensions')" 2>&1) -join ' '
+          Note 'autoload,autoinstall' $settings
+          if ($settings.Trim() -ne 'true,false') { throw "expected autoload=true, autoinstall=false; got: $settings" }
+
           $att = (gh attestation verify $exe --owner "${{ github.repository_owner }}" 2>&1) -join "`n"
           if ($LASTEXITCODE -ne 0) { throw "attestation verification failed: $att" }
           Note 'attestation' 'verified'
