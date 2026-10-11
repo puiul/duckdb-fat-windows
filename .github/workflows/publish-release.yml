@@ -1,0 +1,92 @@
+# Takes the duckdb.exe artifact from a finished duckdb-fat-windows run,
+# re-checks it on a clean Windows runner, and creates a DRAFT release.
+# Nothing becomes public until the draft is reviewed and published.
+name: publish-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Run ID of the duckdb-fat-windows build to publish"
+        required: true
+      duckdb_ref:
+        description: "DuckDB tag that run built (e.g. v1.5.6); names the artifact"
+        required: true
+      tag:
+        description: "Release tag to create (e.g. v1.5.6-fat-1)"
+        required: true
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    permissions:
+      contents: write   # create the release
+      actions: read     # download another run's artifact
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download the build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: duckdb-windows-amd64-static-${{ inputs.duckdb_ref }}
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: dist
+
+      # Hard checks: any failure stops the job before a release is created.
+      - name: Verify the binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "dist/duckdb.exe"
+          $expected = @('autocomplete','avro','core_functions','ducklake','excel','httpfs',
+                        'iceberg','icu','inet','json','parquet','shell')
+
+          $version = (& $exe --version) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "--version failed: $version" }
+
+          $table = (& $exe -c "SELECT extension_name, install_mode FROM duckdb_extensions() WHERE loaded ORDER BY 1") -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "extension query failed: $table" }
+
+          $linked = & $exe -csv -noheader -c "SELECT extension_name FROM duckdb_extensions() WHERE loaded AND install_mode = 'STATICALLY_LINKED' ORDER BY 1"
+          if ($LASTEXITCODE -ne 0) { throw "linked-extension query failed" }
+          $missing = $expected | Where-Object { $_ -notin $linked }
+          if ($missing) { throw "Not statically linked: $($missing -join ', ')" }
+
+          $https = (& $exe -c "SELECT count(*) AS rows FROM read_csv('https://raw.githubusercontent.com/duckdb/duckdb/v1.5.5/data/csv/aws_locations.csv')") -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "HTTPS read failed: $https" }
+
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item $exe).Length
+
+          gh attestation verify $exe --owner "${{ github.repository_owner }}" --repo "${{ github.repository }}"
+          if ($LASTEXITCODE -ne 0) { throw "attestation verification failed" }
+
+          $fence = '```'
+          @"
+          <!-- VERIFICATION (replace before publishing) -->
+          version: $version
+          sha256: $hash
+          size: $size
+          build run: https://github.com/${{ github.repository }}/actions/runs/${{ inputs.run_id }}
+          attestation: verified
+
+          $fence
+          $table
+          $fence
+
+          https check:
+          $fence
+          $https
+          $fence
+          "@ | Set-Content -Path draft-notes.md
+
+      - name: Create draft release
+        shell: pwsh
+        run: |
+          gh release create "${{ inputs.tag }}" dist/duckdb.exe `
+            --repo "${{ github.repository }}" `
+            --draft `
+            --target "${{ github.sha }}" `
+            --title "DuckDB ${{ inputs.duckdb_ref }} - Windows x64, statically linked extensions (draft)" `
+            --notes-file draft-notes.md
