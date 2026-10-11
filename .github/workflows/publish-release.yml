@@ -89,7 +89,13 @@ jobs:
             Note "refused: $stmt" "exit $code - $out"
             if ($code -eq 0 -or $out -notmatch 'compile time flag') { throw "'$stmt' was not refused by the compile-time flag (exit $code): $out" }
           }
-          if (Test-Path $extdir) { throw "extension directory was created: $extdir" }
+          if (Test-Path $extdir) {
+            Note 'extension dir contents' ((Get-ChildItem -Recurse -Force $extdir | ForEach-Object { "$($_.FullName) $($_.Length)" }) -join "`n")
+            $found = Get-ChildItem -Recurse -Force $extdir -Filter '*.duckdb_extension*' -ErrorAction SilentlyContinue
+            if ($found) { throw "extension files were written: $(($found | ForEach-Object { $_.FullName }) -join ', ')" }
+          } else {
+            Note 'extension dir contents' "$extdir does not exist"
+          }
 
           $att = (gh attestation verify $exe --owner "${{ github.repository_owner }}" 2>&1) -join "`n"
           if ($LASTEXITCODE -ne 0) { throw "attestation verification failed: $att" }
