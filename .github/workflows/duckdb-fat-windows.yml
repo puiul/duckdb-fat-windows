@@ -111,6 +111,7 @@ jobs:
                 -DBUILD_UNITTESTS=FALSE `
                 -DBUILD_BENCHMARKS=FALSE `
                 -DEXTENSION_STATIC_BUILD=TRUE `
+                -DENABLE_EXTENSION_AUTOLOADING=1 `
                 -DBUILD_EXTENSIONS="${{ inputs.extensions }}" `
                 -DVCPKG_MANIFEST_DIR="$env:GITHUB_WORKSPACE/build/extension_configuration" `
                 -DVCPKG_TARGET_TRIPLET=x64-windows-static `
