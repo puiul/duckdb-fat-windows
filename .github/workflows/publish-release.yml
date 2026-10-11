@@ -80,6 +80,17 @@ jobs:
           Note 'autoload,autoinstall' $settings
           if ($settings.Trim() -ne 'true,false') { throw "expected autoload=true, autoinstall=false; got: $settings" }
 
+          # Built with DISABLE_EXTENSION_LOAD: INSTALL and LOAD must be refused,
+          # and nothing may be written to the extension directory.
+          $extdir = Join-Path $env:USERPROFILE '.duckdb'
+          foreach ($stmt in @('INSTALL ui', 'LOAD ui', 'INSTALL json')) {
+            $out = (& $exe -c $stmt 2>&1) -join ' '
+            $code = $LASTEXITCODE
+            Note "refused: $stmt" "exit $code - $out"
+            if ($code -eq 0 -or $out -notmatch 'compile time flag') { throw "'$stmt' was not refused by the compile-time flag (exit $code): $out" }
+          }
+          if (Test-Path $extdir) { throw "extension directory was created: $extdir" }
+
           $att = (gh attestation verify $exe --owner "${{ github.repository_owner }}" 2>&1) -join "`n"
           if ($LASTEXITCODE -ne 0) { throw "attestation verification failed: $att" }
           Note 'attestation' 'verified'
