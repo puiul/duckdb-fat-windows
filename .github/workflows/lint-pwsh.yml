@@ -1,0 +1,53 @@
+# Parses every PowerShell `run:` block in this repo's workflows, so a syntax
+# error fails in a minute here instead of hours into a build.
+name: lint-pwsh
+
+on:
+  push:
+    paths: [".github/workflows/**"]
+  workflow_dispatch:
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract pwsh run blocks
+        shell: python
+        run: |
+          import pathlib, re, yaml
+          out = pathlib.Path("pwsh-blocks"); out.mkdir()
+          n = 0
+          for wf in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
+              doc = yaml.safe_load(wf.read_text())
+              for job_id, job in (doc.get("jobs") or {}).items():
+                  shell = ((job.get("defaults") or {}).get("run") or {}).get("shell")
+                  for i, step in enumerate(job.get("steps") or []):
+                      if "run" not in step or step.get("shell", shell) != "pwsh":
+                          continue
+                      # GitHub expressions are substituted before pwsh sees the text.
+                      body = re.sub(r"\$\{\{.*?\}\}", "EXPR", step["run"], flags=re.S)
+                      name = f"{wf.stem}__{job_id}__{i:02d}.ps1"
+                      (out / name).write_text(body)
+                      print(f"{name}: {step.get('name', '')}")
+                      n += 1
+          print(f"{n} block(s)")
+
+      - name: Parse them
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem pwsh-blocks -Filter *.ps1) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+            if ($errs) {
+              $bad++
+              foreach ($e in $errs) {
+                Write-Output "::error title=$($f.Name)::line $($e.Extent.StartLineNumber): $($e.Message)"
+              }
+            } else { Write-Output "ok  $($f.Name)" }
+          }
+          if ($bad) { exit 1 }
