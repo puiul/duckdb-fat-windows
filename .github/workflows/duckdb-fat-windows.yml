@@ -215,7 +215,7 @@ jobs:
                 -DBUILD_BENCHMARKS=FALSE `
                 -DEXTENSION_STATIC_BUILD=TRUE `
                 -DENABLE_EXTENSION_AUTOLOADING=1 `
-                -DENABLE_EXTENSION_LOAD=$load `
+                "-DENABLE_EXTENSION_LOAD=$load" `
                 -DBUILD_COMPLETE_EXTENSION_SET=${{ inputs.variant == 'fat' && 'TRUE' || 'FALSE' }} `
                 -DBUILD_EXTENSIONS="$env:EXTS" `
                 -DSTATICALLY_LINK_EXTENSIONS="$env:EXTS" `
@@ -235,6 +235,14 @@ jobs:
           }
           $linked = [regex]::Match($log, 'Linked into DuckDB: extensions \[([^\]]*)\]').Groups[1].Value
           Write-Host "Linked into DuckDB: [$linked]"
+          # The last "Linked into DuckDB" line is the real configure (the first
+          # comes from the extension-configuration pass). The chubby must not
+          # link the loader library.
+          $caps = ([regex]::Matches($log, 'Linked into DuckDB: extensions \[[^\]]*\], capabilities \[([^\]]*)\]') | Select-Object -Last 1).Groups[1].Value
+          Write-Host "capabilities: [$caps]"
+          if ("${{ inputs.variant }}" -eq 'chubby' -and $caps -match 'loadable_extensions') {
+            throw "chubby lock did not take: capabilities [$caps] include loadable_extensions"
+          }
       # The generated extension loader includes <name>_extension.hpp. List what
       # each extension ships and shim the expected name if it differs.
       - name: Inspect and shim extension headers
