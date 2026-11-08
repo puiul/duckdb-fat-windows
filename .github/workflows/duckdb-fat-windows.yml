@@ -28,6 +28,11 @@ on:
         description: "Optional: semicolon-separated list overriding the variant's default (dependency order matters)"
         required: false
         default: ""
+      vcpkg_commit:
+        description: "vcpkg commit to pin (DuckDB's CI pin for this release); empty = runner's preinstalled vcpkg"
+        required: false
+        # duckdb v2.0.0 .github/workflows: vcpkg-commit cd61e1e2 "Release 2026.06.24"
+        default: "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3"
 
 jobs:
   build:
@@ -78,6 +83,26 @@ jobs:
           ref: ${{ inputs.duckdb_ref }}
           fetch-depth: 0   # git describe needs the tags
 
+      # The runner's vcpkg is days old; DuckDB's extensions are tested against
+      # DuckDB's pinned vcpkg. Mixing them broke the fat build: spatial's
+      # overlay port vcpkg-tool-meson@1.9.0 includes the builtin portfile,
+      # which on the runner had moved to meson 1.12.1, so the download hash
+      # did not match. Pin the checkout and rebuild the tool to match.
+      - name: Pin vcpkg
+        if: inputs.vcpkg_commit != ''
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          Write-Host "runner vcpkg: $(git -C $root log -1 --format='%h %cs %s')"
+          git -C $root fetch --quiet origin "${{ inputs.vcpkg_commit }}"
+          if ($LASTEXITCODE -ne 0) { throw "fetch of ${{ inputs.vcpkg_commit }} failed" }
+          git -C $root checkout --quiet --force FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "checkout failed" }
+          & "$root\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap failed" }
+          Write-Host "pinned vcpkg: $(git -C $root log -1 --format='%H %cs %s')"
+          & "$root\vcpkg.exe" version
+
       - name: Rust toolchain report
         if: inputs.variant == 'fat'
         shell: pwsh
@@ -93,11 +118,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: vcpkg-bincache
-          key: vcpkg-${{ runner.os }}-${{ inputs.variant }}-${{ inputs.duckdb_ref }}-${{ hashFiles('.github/config/extensions/*.cmake') }}
+          key: vcpkg-${{ runner.os }}-${{ inputs.variant }}-${{ inputs.duckdb_ref }}-${{ inputs.vcpkg_commit }}-${{ hashFiles('.github/config/extensions/*.cmake') }}
           restore-keys: |
-            vcpkg-${{ runner.os }}-${{ inputs.variant }}-${{ inputs.duckdb_ref }}-
+            vcpkg-${{ runner.os }}-${{ inputs.variant }}-${{ inputs.duckdb_ref }}-${{ inputs.vcpkg_commit }}-
             vcpkg-${{ runner.os }}-${{ inputs.variant }}-
-            vcpkg-${{ runner.os }}-
 
       - name: Ensure vcpkg cache folder exists
         shell: pwsh
