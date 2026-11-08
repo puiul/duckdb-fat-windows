@@ -9,11 +9,18 @@ on:
       run_id:
         description: "Run ID of the duckdb-fat-windows build to publish"
         required: true
-      duckdb_ref:
-        description: "DuckDB tag that run built (e.g. v1.5.6); names the artifact"
+      variant:
+        description: "Variant that run built"
         required: true
+        type: choice
+        options: [chubby, fat]
+        default: chubby
+      duckdb_ref:
+        description: "DuckDB tag that run built (e.g. v2.0.0); names the artifact"
+        required: true
+        default: "v2.0.0"
       tag:
-        description: "Release tag to create (e.g. v1.5.6-fat-1)"
+        description: "Release tag to create (e.g. v2.0.0-chubby-1)"
         required: true
 
 jobs:
@@ -28,10 +35,18 @@ jobs:
       - name: Download the build artifact
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-windows-amd64-static-${{ inputs.duckdb_ref }}
+          name: duckdb-windows-amd64-${{ inputs.variant }}-${{ inputs.duckdb_ref }}
           run-id: ${{ inputs.run_id }}
           github-token: ${{ github.token }}
           path: dist
+
+      - name: Download the SBOM inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-${{ inputs.variant }}-${{ inputs.duckdb_ref }}
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: sbom
 
       # Hard checks: any failure stops the job before a release is created.
       - name: Verify the binary
@@ -39,7 +54,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           # Findings are also emitted as annotations, readable via the
-          # check-runs API without access to the raw log.
+          # check-runs API without access to the raw log. GitHub shows at most
+          # ten per step, so the important ones come first.
           function Note([string]$title, [string]$msg) {
             $m = ($msg -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
             Write-Output "::notice title=${title}::$m"
@@ -49,83 +65,116 @@ jobs:
             Write-Output "::error title=Verify failed::$m"
             exit 1
           }
-          $exe = "dist/duckdb.exe"
-          Note 'files' ((Get-ChildItem -Recurse dist | ForEach-Object { "$($_.FullName) $($_.Length)" }) -join "`n")
-          $expected = @('autocomplete','avro','core_functions','ducklake','excel','httpfs',
-                        'iceberg','icu','inet','json','parquet','shell')
+          $variant = "${{ inputs.variant }}"
+          $exe = (Resolve-Path "dist/duckdb.exe").Path
+          $base = @('autocomplete','core_functions','icu','json','parquet','shell')
+          $expected = if ($variant -eq 'fat') {
+            $base + @('avro','aws','azure','delta','ducklake','encodings','excel','fts','glue','httpfs',
+                      'iceberg','inet','lance','legacy_parser','mysql_scanner','odbc_scanner',
+                      'postgres_scanner','quack','spatial','sqlite_scanner','unity_catalog','vss')
+          } else {
+            $base + @('ducklake','excel','httpfs','sqlite_scanner')
+          }
 
           $version = (& $exe --version 2>&1) -join "`n"
-          Note 'version' $version
           if ($LASTEXITCODE -ne 0) { throw "--version failed (exit $LASTEXITCODE): $version" }
+          if ($version -notmatch "^${{ inputs.duckdb_ref }}\s" -or $version -match 'Development|-dev\d') {
+            throw "version '$version' is not the release ${{ inputs.duckdb_ref }}"
+          }
 
-          $table = (& $exe -c "SELECT extension_name, install_mode FROM duckdb_extensions() WHERE loaded ORDER BY 1" 2>&1) -join "`n"
-          Note 'loaded extensions' $table
-          if ($LASTEXITCODE -ne 0) { throw "extension query failed: $table" }
-
-          $linked = & $exe -csv -noheader -c "SELECT extension_name FROM duckdb_extensions() WHERE loaded AND install_mode = 'STATICALLY_LINKED' ORDER BY 1" 2>&1
+          # DuckDB 2.0 loads linked extensions at startup only when they register;
+          # judge linking by install_mode, and report loaded state separately.
+          $all = (& $exe -csv -c "SELECT extension_name, loaded, install_mode FROM duckdb_extensions() WHERE install_mode = 'STATICALLY_LINKED' ORDER BY 1" 2>&1) -join "`n"
+          Note 'linked extensions (name,loaded,mode)' $all
+          $linked = & $exe -csv -noheader -c "SELECT extension_name FROM duckdb_extensions() WHERE install_mode = 'STATICALLY_LINKED' ORDER BY 1" 2>&1
           if ($LASTEXITCODE -ne 0) { throw "linked-extension query failed: $($linked -join ' ')" }
           $missing = $expected | Where-Object { $_ -notin $linked }
-          if ($missing) { throw "Not statically linked: $($missing -join ', ')" }
-
-          $https = (& $exe -c "SELECT count(*) AS rows FROM read_csv('https://raw.githubusercontent.com/duckdb/duckdb/v1.5.5/data/csv/aws_locations.csv')" 2>&1) -join "`n"
-          Note 'https' $https
-          if ($LASTEXITCODE -ne 0) { throw "HTTPS read failed: $https" }
+          if ($missing) { throw "Not statically linked: $($missing -join ', '). Linked: $($linked -join ', ')" }
+          $extra = $linked | Where-Object { $_ -notin $expected }
+          Note 'statically linked' "$($linked.Count): $($linked -join ', ')$(if ($extra) { " (unexpected: $($extra -join ', '))" })"
 
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
           $size = (Get-Item $exe).Length
-          Note 'sha256' "$hash ($size bytes)"
+          Note 'sha256' "$hash ($size bytes) $version"
 
-          # Autoloading on (installed extensions load on first use), autoinstall off.
+          # Functional checks in a scratch folder.
+          $work = Join-Path $env:RUNNER_TEMP 'verify'
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Push-Location $work
+
+          # DuckLake with a SQLite catalog (the Dell use case), then reopen it.
+          $sql1 = "ATTACH 'ducklake:sqlite:lake.sqlite' AS lake (DATA_PATH 'lake_files/'); CREATE TABLE lake.t AS SELECT range AS i FROM range(5); INSERT INTO lake.t VALUES (99);"
+          $out = (& $exe -c $sql1 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "ducklake+sqlite write failed: $out" }
+          $out = (& $exe -csv -noheader -c "ATTACH 'ducklake:sqlite:lake.sqlite' AS lake; SELECT count(*), sum(i) FROM lake.t;" 2>&1) -join ' '
+          if ($LASTEXITCODE -ne 0 -or $out.Trim() -ne '6,109') { throw "ducklake+sqlite reopen gave '$out', expected 6,109" }
+
+          # DuckLake with a DuckDB-file catalog.
+          $out = (& $exe -csv -noheader -c "ATTACH 'ducklake:meta.ducklake' AS l2 (DATA_PATH 'l2_files/'); CREATE TABLE l2.t AS SELECT 42 AS x; SELECT x FROM l2.t;" 2>&1) -join ' '
+          if ($LASTEXITCODE -ne 0 -or $out.Trim() -ne '42') { throw "ducklake+duckdb gave '$out', expected 42" }
+
+          # Excel round trip. xlsx stores numbers as doubles, so read_xlsx returns 1.0.
+          $out = (& $exe -csv -noheader -c "COPY (SELECT 1 AS a, 'x' AS b) TO 'rt.xlsx' WITH (FORMAT xlsx, HEADER true); SELECT a::INTEGER, b FROM read_xlsx('rt.xlsx');" 2>&1) -join ' '
+          if ($LASTEXITCODE -ne 0 -or $out.Trim() -ne '1,x') { throw "excel round trip gave '$out', expected 1,x" }
+
+          # HTTPS read (static OpenSSL/libcurl, no CA bundle configured).
+          $https = (& $exe -csv -noheader -c "SELECT count(*) FROM read_csv('https://raw.githubusercontent.com/duckdb/duckdb/v1.5.5/data/csv/aws_locations.csv')" 2>&1) -join ' '
+          if ($LASTEXITCODE -ne 0) { throw "HTTPS read failed: $https" }
+          Note 'functional' "ducklake+sqlite ok, ducklake+duckdb ok, excel ok, https rows=$($https.Trim())"
+          Pop-Location
+
+          # DuckDB 2.0 removed the build options for these; both default to true
+          # and can only be changed at runtime. Reported, not enforced: on the
+          # chubby the lock below makes autoinstall moot.
           $settings = (& $exe -csv -noheader -c "SELECT current_setting('autoload_known_extensions'), current_setting('autoinstall_known_extensions')" 2>&1) -join ' '
-          Note 'autoload,autoinstall' $settings
-          if ($settings.Trim() -ne 'true,false') { throw "expected autoload=true, autoinstall=false; got: $settings" }
+          Note 'autoload,autoinstall' $settings.Trim()
 
-          # Built with DISABLE_EXTENSION_LOAD: INSTALL and LOAD must be refused,
-          # and nothing may be written to the extension directory.
           $extdir = Join-Path $env:USERPROFILE '.duckdb'
-          foreach ($stmt in @('INSTALL ui', 'LOAD ui', 'INSTALL json')) {
-            $out = (& $exe -c $stmt 2>&1) -join ' '
-            $code = $LASTEXITCODE
-            Note "refused: $stmt" "exit $code - $out"
-            if ($code -eq 0 -or $out -notmatch 'compile time flag') { throw "'$stmt' was not refused by the compile-time flag (exit $code): $out" }
+          if ($variant -eq 'chubby') {
+            # Built with DISABLE_EXTENSION_LOAD: INSTALL and LOAD must be refused,
+            # and nothing may be written to the extension directory.
+            foreach ($stmt in @('INSTALL ui', 'LOAD ui', 'INSTALL json')) {
+              $out = (& $exe -c $stmt 2>&1) -join ' '
+              $code = $LASTEXITCODE
+              # 1.5: "disabled through a compile time flag"; 2.0: no loader library linked
+              if ($code -eq 0 -or $out -notmatch 'compile time flag|does not link the loadable_extensions library') { throw "'$stmt' was not refused (exit $code): $out" }
+            }
+            Note 'locked' "INSTALL ui, LOAD ui, INSTALL json all refused; last: $out"
           }
-          if (Test-Path $extdir) {
-            Note 'extension dir contents' ((Get-ChildItem -Recurse -Force $extdir | ForEach-Object { "$($_.FullName) $($_.Length)" }) -join "`n")
-            $found = Get-ChildItem -Recurse -Force $extdir -Filter '*.duckdb_extension*' -ErrorAction SilentlyContinue
-            if ($found) { throw "extension files were written: $(($found | ForEach-Object { $_.FullName }) -join ', ')" }
-          } else {
-            Note 'extension dir contents' "$extdir does not exist"
-          }
+          $found = if (Test-Path $extdir) { Get-ChildItem -Recurse -Force $extdir -Filter '*.duckdb_extension*' -ErrorAction SilentlyContinue }
+          if ($found) { throw "extension files were written: $(($found | ForEach-Object { $_.FullName }) -join ', ')" }
 
           $att = (gh attestation verify $exe --owner "${{ github.repository_owner }}" 2>&1) -join "`n"
           if ($LASTEXITCODE -ne 0) { throw "attestation verification failed: $att" }
           Note 'attestation' 'verified'
 
+          $table = (& $exe -c "SELECT extension_name, install_mode FROM duckdb_extensions() WHERE loaded ORDER BY 1" 2>&1) -join "`n"
           $fence = '```'
           @"
           <!-- VERIFICATION (replace before publishing) -->
+          variant: $variant
           version: $version
           sha256: $hash
           size: $size
           build run: https://github.com/${{ github.repository }}/actions/runs/${{ inputs.run_id }}
           attestation: verified
+          functional: ducklake (sqlite + duckdb catalogs), excel round trip, https read
 
           $fence
           $table
           $fence
-
-          https check:
-          $fence
-          $https
-          $fence
           "@ | Set-Content -Path draft-notes.md
+
+      - name: Package SBOM inputs
+        shell: pwsh
+        run: Compress-Archive -Path sbom/* -DestinationPath "sbom-${{ inputs.variant }}-${{ inputs.duckdb_ref }}.zip"
 
       - name: Create draft release
         shell: pwsh
         run: |
-          gh release create "${{ inputs.tag }}" dist/duckdb.exe `
+          gh release create "${{ inputs.tag }}" dist/duckdb.exe "sbom-${{ inputs.variant }}-${{ inputs.duckdb_ref }}.zip" `
             --repo "${{ github.repository }}" `
             --draft `
             --target "${{ github.sha }}" `
-            --title "DuckDB ${{ inputs.duckdb_ref }} - Windows x64, statically linked extensions (draft)" `
+            --title "DuckDB ${{ inputs.duckdb_ref }} ${{ inputs.variant }} - Windows x64, statically linked extensions (draft)" `
             --notes-file draft-notes.md

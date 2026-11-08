@@ -1,18 +1,38 @@
-# Builds duckdb.exe for windows_amd64 with the listed extensions statically linked.
+# Builds duckdb.exe for windows_amd64 with extensions statically linked.
 # Runs only on manual trigger (Actions tab -> "Run workflow").
+#
+# Two variants:
+#   chubby - for the Dell work laptop: ducklake, excel, httpfs, sqlite_scanner
+#            on top of the in-tree set. Built with DISABLE_EXTENSION_LOAD, so
+#            INSTALL/LOAD are refused and only the built-ins can ever run.
+#   fat    - everything that builds for windows_amd64 at DuckDB 2.0 (vortex is
+#            excluded upstream on WIN32; sqlsmith and test-utils are test
+#            tools). Extension loading stays enabled, autoloading on,
+#            autoinstall off.
 name: duckdb-fat-windows
 
 on:
   workflow_dispatch:
     inputs:
+      variant:
+        description: "chubby (Dell laptop, locked) or fat (everything)"
+        required: true
+        type: choice
+        options: [chubby, fat]
+        default: chubby
       duckdb_ref:
         description: "DuckDB git tag to build (see https://github.com/duckdb/duckdb/releases)"
         required: true
-        default: "v1.5.6"
+        default: "v2.0.0"
       extensions:
-        description: "Semicolon-separated extension list to link in"
-        required: true
-        default: "parquet;core_functions;avro;autocomplete;icu;json;excel;httpfs;iceberg;ducklake;inet"
+        description: "Optional: semicolon-separated list overriding the variant's default (dependency order matters)"
+        required: false
+        default: ""
+      vcpkg_commit:
+        description: "vcpkg commit to pin (DuckDB's CI pin for this release); empty = runner's preinstalled vcpkg"
+        required: false
+        # duckdb v2.0.0 .github/workflows: vcpkg-commit cd61e1e2 "Release 2026.06.24"
+        default: "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3"
 
 jobs:
   build:
@@ -24,9 +44,42 @@ jobs:
     env:
       # Explicit folder so the cache action and vcpkg agree on the path
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-bincache
-    timeout-minutes: 180
+      # The EXE uses the static C runtime (x64-windows-static). Rust builds
+      # default to the dynamic one; make the Rust-based extensions (delta,
+      # unity_catalog, lance) match. Target-scoped, so build scripts are unaffected.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+    # GitHub-hosted runners stop at 360 min. The steps below get their own
+    # limits so a long cold vcpkg run still leaves time to save the cache.
+    timeout-minutes: ${{ inputs.variant == 'fat' && 360 || 180 }}
 
     steps:
+      # Extension order matters: an extension whose dependency is not linked
+      # yet triggers autoload at startup, and then every invocation dies
+      # (avro before iceberg, delta before unity_catalog, aws before glue).
+      - name: Resolve variant
+        shell: pwsh
+        run: |
+          $chubby = 'parquet;core_functions;autocomplete;icu;json;excel;httpfs;sqlite_scanner;ducklake'
+          $fat = 'parquet;core_functions;autocomplete;icu;json;avro;excel;inet;fts;vss;encodings;spatial;legacy_parser;httpfs;quack;sqlite_scanner;postgres_scanner;mysql_scanner;odbc_scanner;aws;azure;iceberg;delta;unity_catalog;glue;lance;ducklake'
+          $exts = "${{ inputs.extensions }}".Trim()
+          if (-not $exts) { $exts = if ("${{ inputs.variant }}" -eq 'fat') { $fat } else { $chubby } }
+          "EXTS=$exts" >> $env:GITHUB_ENV
+          # DuckDB 2.0 no longer reads the version from git describe: without
+          # DUCKDB_VERSION a source build reports vX.Y.0-dev<commit count>.
+          $ref = "${{ inputs.duckdb_ref }}"
+          if ($ref -match '^v\d+\.\d+\.\d+$') { "DUCKDB_VERSION=$ref" >> $env:GITHUB_ENV; Write-Host "DUCKDB_VERSION=$ref" }
+          Write-Host "variant=${{ inputs.variant }} duckdb_ref=${{ inputs.duckdb_ref }}"
+          Write-Host "extensions=$exts"
+
+      # duckdb-iceberg ships test data with paths beyond Windows' 260-char
+      # default; git refuses to write them unless long paths are enabled.
+      # Leave core.autocrlf at the runner default (true): with it off, DuckDB's
+      # own avro patch trips an assertion in Strawberry's patch.exe 2.5.9.
+      # The vcpkg overlay patches are fixed separately after the manifest merge.
+      - name: Configure git (long paths)
+        shell: pwsh
+        run: git config --system core.longpaths true
+
       - name: Check out DuckDB source at the requested tag
         uses: actions/checkout@v4
         with:
@@ -34,119 +87,186 @@ jobs:
           ref: ${{ inputs.duckdb_ref }}
           fetch-depth: 0   # git describe needs the tags
 
-      # duckdb-iceberg ships test data with paths beyond Windows' 260-char
-      # default; git refuses to write them unless long paths are enabled.
-      - name: Enable long paths for git
+      # The runner's vcpkg is days old; DuckDB's extensions are tested against
+      # DuckDB's pinned vcpkg. Mixing them broke the fat build: spatial's
+      # overlay port vcpkg-tool-meson@1.9.0 includes the builtin portfile,
+      # which on the runner had moved to meson 1.12.1, so the download hash
+      # did not match. Pin the checkout and rebuild the tool to match.
+      - name: Pin vcpkg
+        if: inputs.vcpkg_commit != ''
         shell: pwsh
-        run: git config --system core.longpaths true
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          Write-Host "runner vcpkg: $(git -C $root log -1 --format='%h %cs %s')"
+          git -C $root fetch --quiet origin "${{ inputs.vcpkg_commit }}"
+          if ($LASTEXITCODE -ne 0) { throw "fetch of ${{ inputs.vcpkg_commit }} failed" }
+          git -C $root checkout --quiet --force FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "checkout failed" }
+          & "$root\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap failed" }
+          Write-Host "pinned vcpkg: $(git -C $root log -1 --format='%H %cs %s')"
+          & "$root\vcpkg.exe" version
 
-      # vcpkg builds the AWS SDK and OpenSSL from source (~20 min); keep the
-      # compiled packages between runs. Restore here, save at the end
-      # regardless of job outcome (plain actions/cache only saves on success).
+      - name: Rust toolchain report
+        if: inputs.variant == 'fat'
+        shell: pwsh
+        run: |
+          rustup show
+          cargo --version
+
+      # vcpkg builds the dependencies from source; keep the compiled packages
+      # between runs. Restore here, save at the end regardless of job outcome
+      # (plain actions/cache only saves on success).
       - name: Restore vcpkg binary packages
         id: vcpkg-cache
         uses: actions/cache/restore@v4
         with:
           path: vcpkg-bincache
-          key: vcpkg-${{ runner.os }}-${{ inputs.duckdb_ref }}-${{ hashFiles('.github/config/extensions/*.cmake') }}
+          key: vcpkg-${{ runner.os }}-${{ inputs.variant }}-${{ inputs.duckdb_ref }}-${{ inputs.vcpkg_commit }}-${{ hashFiles('.github/config/extensions/*.cmake') }}
           restore-keys: |
-            vcpkg-${{ runner.os }}-${{ inputs.duckdb_ref }}-
-            vcpkg-${{ runner.os }}-
+            vcpkg-${{ runner.os }}-${{ inputs.variant }}-${{ inputs.duckdb_ref }}-${{ inputs.vcpkg_commit }}-
+            vcpkg-${{ runner.os }}-${{ inputs.variant }}-
 
       - name: Ensure vcpkg cache folder exists
         shell: pwsh
         run: New-Item -ItemType Directory -Force "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
 
-      # Some of DuckDB's per-extension configs (fts, encodings, sqlite_scanner on
-      # Windows at v1.5.5) carry DONT_LINK, which yields a loadable file instead
-      # of linking into the EXE. DuckDB includes these files directly, so strip
-      # the flag in place. Linked extensions also need INCLUDE_DIR so the
-      # generated loader can find <name>_extension.hpp; DONT_LINK configs omit it.
-      # Note: sqlite_scanner's file says static linking on Windows has symbol
-      # collisions; if the link fails, drop it from the list.
-      - name: Strip DONT_LINK from extension configs
+      # DuckDB <= 1.5 marked some configs (fts, encodings, sqlite_scanner) with
+      # DONT_LINK, which yields a loadable file instead of linking into the EXE.
+      # None carry it at v2.0.0; this stays as a no-op guard for older refs.
+      # Linked extensions also need INCLUDE_DIR so the generated loader can
+      # find <name>_extension.hpp; fts's config still omits it at v2.0.0.
+      - name: Strip DONT_LINK, add missing INCLUDE_DIR
         shell: pwsh
         run: |
-          foreach ($ext in "${{ inputs.extensions }}".Split(';', [StringSplitOptions]::RemoveEmptyEntries)) {
+          foreach ($ext in $env:EXTS.Split(';', [StringSplitOptions]::RemoveEmptyEntries)) {
             $cfg = ".github/config/extensions/$ext.cmake"
-            if ((Test-Path $cfg) -and (Select-String -Path $cfg -Pattern 'DONT_LINK' -Quiet)) {
+            if (-not (Test-Path $cfg)) { continue }   # in-tree extension
+            $txt = Get-Content $cfg -Raw
+            $orig = $txt
+            if ($txt -match '\bDONT_LINK\b') {
               Write-Host "Stripping DONT_LINK from $cfg"
-              $txt = (Get-Content $cfg -Raw) -replace '\bDONT_LINK\b', ''
-              if ($txt -notmatch 'INCLUDE_DIR') {
-                $txt = $txt -replace '(\s+)GIT_URL', '$1INCLUDE_DIR src/include$1GIT_URL'
-              }
-              $txt | Set-Content -Path $cfg -NoNewline
-              Get-Content $cfg
+              $txt = $txt -replace '\bDONT_LINK\b', ''
             }
+            if ($txt -notmatch 'INCLUDE_DIR' -and $ext -in @('fts')) {
+              Write-Host "Adding INCLUDE_DIR src/include to $cfg"
+              $txt = $txt -replace '(\s+)GIT_URL', '$1INCLUDE_DIR src/include$1GIT_URL'
+            }
+            if ($txt -ne $orig) { $txt | Set-Content -Path $cfg -NoNewline; Get-Content $cfg }
           }
 
       # Phase 1: DuckDB's "extension configuration" build. It resolves the
-      # out-of-tree extensions (excel, httpfs, iceberg live in their own repos,
-      # pinned per DuckDB release under .github/config/extensions/) and merges
-      # their vcpkg.json dependency manifests into one.
+      # out-of-tree extensions (pinned per DuckDB release under
+      # .github/config/extensions/) and merges their vcpkg.json manifests.
       - name: Merge extension vcpkg manifests
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force build/extension_configuration | Out-Null
           Set-Location build/extension_configuration
           cmake -DEXTENSION_CONFIG_BUILD=TRUE `
-                -DBUILD_EXTENSIONS="${{ inputs.extensions }}" `
+                -DBUILD_EXTENSIONS="$env:EXTS" `
+                -DBUILD_COMPLETE_EXTENSION_SET=${{ inputs.variant == 'fat' && 'TRUE' || 'FALSE' }} `
                 -DCMAKE_BUILD_TYPE=Release `
                 -DCMAKE_GENERATOR_PLATFORM=x64 `
                 ../..
           cmake --build . --config Release
           Get-ChildItem
 
-      # Phase 2: real configure. vcpkg (preinstalled on the runner) installs the
-      # merged dependencies (OpenSSL for httpfs, AWS SDK for iceberg, etc.) in
-      # manifest mode.
+      # The runner's git checks extensions out with CRLF. vcpkg applies an
+      # overlay port's patches with git apply against LF source tarballs, and
+      # a blank context line in a CRLF patch becomes a lone CR that git apply
+      # rejects as "corrupt patch" (duckdb-aws's aws-c-io patch at v2.0.0,
+      # which applies cleanly as LF). Convert those patch files back to LF.
+      - name: Normalise vcpkg overlay patches to LF
+        shell: pwsh
+        run: |
+          $n = 0
+          Get-ChildItem build/extension_configuration/_deps -Recurse -Filter *.patch -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '[\\/]vcpkg_ports[\\/]' } |
+            ForEach-Object {
+              $bytes = [IO.File]::ReadAllBytes($_.FullName)
+              $latin1 = [Text.Encoding]::GetEncoding(28591)   # byte-transparent
+              $text = $latin1.GetString($bytes)
+              if ($text.Contains("`r`n")) {
+                [IO.File]::WriteAllBytes($_.FullName, $latin1.GetBytes($text.Replace("`r`n", "`n")))
+                Write-Host "LF: $($_.FullName)"
+                $n++
+              }
+            }
+          Write-Host "$n patch file(s) converted"
+
+      # Phase 2: real configure. vcpkg installs the merged dependencies in
+      # manifest mode; on a cold cache this is the long part.
+      # DuckDB 2.0 changes: BUILD_EXTENSIONS only builds an extension; it is
+      # linked only when named in STATICALLY_LINK_EXTENSIONS (DONT_LINK is gone).
+      # The lock is ENABLE_EXTENSION_LOAD=OFF, which leaves the loader library
+      # out of the link (DISABLE_EXTENSION_LOAD is a deprecated alias).
       - name: Configure
+        timeout-minutes: ${{ inputs.variant == 'fat' && 300 || 150 }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force build/release | Out-Null
           Set-Location build/release
+          $load = if ("${{ inputs.variant }}" -eq 'chubby') { 'OFF' } else { 'ON' }
           cmake -DCMAKE_BUILD_TYPE=Release `
                 -DCMAKE_GENERATOR_PLATFORM=x64 `
                 -DBUILD_SHELL=TRUE `
                 -DBUILD_UNITTESTS=FALSE `
                 -DBUILD_BENCHMARKS=FALSE `
                 -DEXTENSION_STATIC_BUILD=TRUE `
-                -DENABLE_EXTENSION_AUTOLOADING=1 `
-                -DDISABLE_EXTENSION_LOAD=TRUE `
-                -DBUILD_EXTENSIONS="${{ inputs.extensions }}" `
+                "-DENABLE_EXTENSION_LOAD=$load" `
+                -DBUILD_COMPLETE_EXTENSION_SET=${{ inputs.variant == 'fat' && 'TRUE' || 'FALSE' }} `
+                -DBUILD_EXTENSIONS="$env:EXTS" `
+                -DSTATICALLY_LINK_EXTENSIONS="$env:EXTS" `
                 -DVCPKG_MANIFEST_DIR="$env:GITHUB_WORKSPACE/build/extension_configuration" `
                 -DVCPKG_TARGET_TRIPLET=x64-windows-static `
                 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-                ../..
-
-      # The generated extension loader includes <name>_extension.hpp. Older
-      # extensions (fts, encodings, sqlite_scanner) may ship the header under a
-      # different name; list what is there and shim the expected name if needed.
+                ../.. 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/configure.log"
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed (exit $LASTEXITCODE)" }
+          # Fail now, not hours later, if any requested extension would be left out.
+          $log = Get-Content "$env:GITHUB_WORKSPACE/configure.log" -Raw
+          $m = [regex]::Match($log, 'Extensions built but not linked: \[([^\]]*)\]')
+          if ($m.Success) {
+            $notLinked = $m.Groups[1].Value.Split(',').Trim() | Where-Object { $_ }
+            $wanted = $env:EXTS.Split(';', [StringSplitOptions]::RemoveEmptyEntries)
+            $bad = $notLinked | Where-Object { $_ -in $wanted }
+            if ($bad) { throw "requested but not linked: $($bad -join ', ')" }
+          }
+          $linked = [regex]::Match($log, 'Linked into DuckDB: extensions \[([^\]]*)\]').Groups[1].Value
+          Write-Host "Linked into DuckDB: [$linked]"
+          # The last "Linked into DuckDB" line is the real configure (the first
+          # comes from the extension-configuration pass). The chubby must not
+          # link the loader library.
+          $caps = ([regex]::Matches($log, 'Linked into DuckDB: extensions \[[^\]]*\], capabilities \[([^\]]*)\]') | Select-Object -Last 1).Groups[1].Value
+          Write-Host "capabilities: [$caps]"
+          if ("${{ inputs.variant }}" -eq 'chubby' -and $caps -match 'loadable_extensions') {
+            throw "chubby lock did not take: capabilities [$caps] include loadable_extensions"
+          }
+      # The generated extension loader includes <name>_extension.hpp. List what
+      # each extension ships and shim the expected name if it differs.
       - name: Inspect and shim extension headers
         shell: pwsh
         run: |
-          foreach ($ext in "${{ inputs.extensions }}".Split(';', [StringSplitOptions]::RemoveEmptyEntries)) {
+          foreach ($ext in $env:EXTS.Split(';', [StringSplitOptions]::RemoveEmptyEntries)) {
             $src = "build/release/_deps/${ext}_extension_fc-src"
             if (-not (Test-Path $src)) { continue }   # in-tree extension
             $inc = Join-Path $src "src/include"
-            Write-Host "== $ext headers under src/include:"
-            if (Test-Path $inc) {
-              Get-ChildItem -Path $inc -Recurse -Filter *.hpp | ForEach-Object { "   " + $_.FullName.Substring((Resolve-Path $inc).Path.Length + 1) }
-            } else { Write-Host "   (no src/include directory)" }
             $want = Join-Path $inc "${ext}_extension.hpp"
-            if (-not (Test-Path $want)) {
-              $alt = Get-ChildItem -Path $src -Recurse -Filter "${ext}-extension.hpp" | Select-Object -First 1
-              if ($alt) {
-                New-Item -ItemType Directory -Force $inc | Out-Null
-                Set-Content -Path $want -Value "#pragma once`n#include `"$($alt.Name)`"`n"
-                Write-Host "   shim written: ${ext}_extension.hpp -> $($alt.Name)"
-              } else {
-                Write-Host "   WARNING: no ${ext}_extension.hpp and no ${ext}-extension.hpp found; link of $ext will fail"
-              }
+            if (Test-Path $want) { Write-Host "== ${ext}: ${ext}_extension.hpp present"; continue }
+            Write-Host "== ${ext}: no ${ext}_extension.hpp; headers found:"
+            Get-ChildItem -Path $src -Recurse -Filter *extension*.hpp | ForEach-Object { "   " + $_.FullName }
+            $alt = Get-ChildItem -Path $src -Recurse -Filter "${ext}-extension.hpp" | Select-Object -First 1
+            if ($alt) {
+              New-Item -ItemType Directory -Force $inc | Out-Null
+              Set-Content -Path $want -Value "#pragma once`n#include `"$($alt.Name)`"`n"
+              Write-Host "   shim written: ${ext}_extension.hpp -> $($alt.Name)"
+            } else {
+              Write-Host "   WARNING: link of $ext may fail"
             }
           }
 
       - name: Build the CLI
+        timeout-minutes: ${{ inputs.variant == 'fat' && 300 || 150 }}
         shell: pwsh
         run: cmake --build build/release --config Release --target shell --parallel 4
 
@@ -170,10 +290,43 @@ jobs:
           & dist/duckdb.exe --version
           Write-Host "`n== SELECT 1"
           & dist/duckdb.exe -c "SELECT 1"
-          Write-Host "`n== extension status"
-          & dist/duckdb.exe -c "SELECT extension_name, loaded, installed, install_mode FROM duckdb_extensions() WHERE extension_name IN ('parquet','core_functions','autocomplete','icu','json','excel','httpfs','iceberg','sqlite_scanner','ducklake','encodings','fts','inet') ORDER BY extension_name"
-          Write-Host "`n== loaded extensions"
-          & dist/duckdb.exe -c "SELECT extension_name, install_mode FROM duckdb_extensions() WHERE loaded ORDER BY extension_name"
+          Write-Host "`n== extensions (all rows)"
+          & dist/duckdb.exe -c "SELECT extension_name, loaded, installed, install_mode FROM duckdb_extensions() ORDER BY install_mode, extension_name"
+
+      # Inputs for a Black Duck / SCA review: vcpkg's per-port SPDX files,
+      # the pinned commit of every out-of-tree extension, and the Cargo.lock
+      # of each Rust-based extension.
+      - name: Collect SBOM inputs
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force sbom/vcpkg | Out-Null
+          $share = "build/release/vcpkg_installed/x64-windows-static/share"
+          if (Test-Path $share) {
+            Get-ChildItem $share -Directory | ForEach-Object {
+              $f = Join-Path $_.FullName 'vcpkg.spdx.json'
+              if (Test-Path $f) { Copy-Item $f "sbom/vcpkg/$($_.Name).spdx.json" }
+            }
+          }
+          $pins = foreach ($ext in $env:EXTS.Split(';', [StringSplitOptions]::RemoveEmptyEntries)) {
+            $cfg = ".github/config/extensions/$ext.cmake"
+            if (Test-Path $cfg) {
+              $t = Get-Content $cfg -Raw
+              $url = [regex]::Match($t, 'GIT_URL\s+(\S+)').Groups[1].Value
+              $tag = [regex]::Match($t, 'GIT_TAG\s+(\S+)').Groups[1].Value
+              "$ext`t$url`t$tag"
+            } else { "$ext`tin-tree`t${{ inputs.duckdb_ref }}" }
+          }
+          "extension`tgit_url`tgit_tag" , $pins | Set-Content sbom/extension-pins.tsv
+          Get-ChildItem build/release/_deps -Recurse -Filter Cargo.lock -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\target\\|\\cargo\\registry\\' } |
+            ForEach-Object { $n = ($_.FullName -replace '^.*\\_deps\\','' -replace '[\\/]','_'); Copy-Item $_.FullName "sbom/$n" }
+          Get-ChildItem -Recurse sbom | ForEach-Object { $_.FullName }
+
+      - name: Disk usage
+        if: always()
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
 
       - name: Save vcpkg binary packages
         if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
@@ -186,9 +339,17 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-windows-amd64-static-${{ inputs.duckdb_ref }}
+          name: duckdb-windows-amd64-${{ inputs.variant }}-${{ inputs.duckdb_ref }}
           path: dist/duckdb.exe
           if-no-files-found: error
+
+      - name: Upload SBOM inputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ inputs.variant }}-${{ inputs.duckdb_ref }}
+          path: sbom
+          if-no-files-found: warn
 
       # Signed provenance (SLSA) linking the EXE to this repo, commit and run.
       # Verify later with: gh attestation verify duckdb.exe --owner <github user>
