@@ -214,7 +214,6 @@ jobs:
                 -DBUILD_UNITTESTS=FALSE `
                 -DBUILD_BENCHMARKS=FALSE `
                 -DEXTENSION_STATIC_BUILD=TRUE `
-                -DENABLE_EXTENSION_AUTOLOADING=1 `
                 "-DENABLE_EXTENSION_LOAD=$load" `
                 -DBUILD_COMPLETE_EXTENSION_SET=${{ inputs.variant == 'fat' && 'TRUE' || 'FALSE' }} `
                 -DBUILD_EXTENSIONS="$env:EXTS" `
