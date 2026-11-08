@@ -70,7 +70,7 @@ jobs:
           $base = @('autocomplete','core_functions','icu','json','parquet','shell')
           $expected = if ($variant -eq 'fat') {
             $base + @('avro','aws','azure','delta','ducklake','encodings','excel','fts','glue','httpfs',
-                      'iceberg','inet','lance','legacy_parser','mysql_scanner','odbc_scanner',
+                      'iceberg','inet','lance','legacy_parser','mysql_scanner',
                       'postgres_scanner','quack','spatial','sqlite_scanner','unity_catalog','vss')
           } else {
             $base + @('ducklake','excel','httpfs','sqlite_scanner')

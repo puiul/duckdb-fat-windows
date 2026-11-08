@@ -6,9 +6,10 @@
 #            on top of the in-tree set. Built with DISABLE_EXTENSION_LOAD, so
 #            INSTALL/LOAD are refused and only the built-ins can ever run.
 #   fat    - everything that builds for windows_amd64 at DuckDB 2.0 (vortex is
-#            excluded upstream on WIN32; sqlsmith and test-utils are test
-#            tools). Extension loading stays enabled, autoloading on,
-#            autoinstall off.
+#            excluded upstream on WIN32; odbc_scanner is a C-API extension
+#            built only as a DLL; sqlsmith and test-utils are test
+#            tools). Extension loading stays enabled; autoload and
+#            autoinstall follow DuckDB 2.0's runtime defaults (both on).
 name: duckdb-fat-windows
 
 on:
@@ -60,7 +61,7 @@ jobs:
         shell: pwsh
         run: |
           $chubby = 'parquet;core_functions;autocomplete;icu;json;excel;httpfs;sqlite_scanner;ducklake'
-          $fat = 'parquet;core_functions;autocomplete;icu;json;avro;excel;inet;fts;vss;encodings;spatial;legacy_parser;httpfs;quack;sqlite_scanner;postgres_scanner;mysql_scanner;odbc_scanner;aws;azure;iceberg;delta;unity_catalog;glue;lance;ducklake'
+          $fat = 'parquet;core_functions;autocomplete;icu;json;avro;excel;inet;fts;vss;encodings;spatial;legacy_parser;httpfs;quack;sqlite_scanner;postgres_scanner;mysql_scanner;aws;azure;iceberg;delta;unity_catalog;glue;lance;ducklake'
           $exts = "${{ inputs.extensions }}".Trim()
           if (-not $exts) { $exts = if ("${{ inputs.variant }}" -eq 'fat') { $fat } else { $chubby } }
           "EXTS=$exts" >> $env:GITHUB_ENV
@@ -264,6 +265,26 @@ jobs:
               Write-Host "   WARNING: link of $ext may fail"
             }
           }
+
+      # avro-c's generic.c declares an empty struct. DuckDB 2.0 builds Windows
+      # with clang-cl, which accepts that in C as a GNU extension; MSVC's C
+      # compiler rejects it (C2016), and the /TP the avro-c CMakeLists asks for
+      # does not reach .c files under the Visual Studio generator. Give it a
+      # one-byte member: field offsets are computed from sizeof() of this
+      # struct, and 1 is what MSVC gave it when avro-c compiled as C++.
+      - name: Patch avro-c empty struct for MSVC
+        shell: pwsh
+        run: |
+          $f = "build/release/_deps/avro_extension_fc-src/third_party/avro-c/lang/c/src/generic.c"
+          if (-not (Test-Path $f)) { Write-Host "avro not in this build"; exit 0 }
+          $src = [IO.File]::ReadAllText($f)
+          $rx = [regex]'(?s)(typedef struct avro_generic_record \{)(\s*/\*.*?\*/\s*)(\} avro_generic_record_t;)'
+          if (-not $rx.IsMatch($src)) { Write-Host "empty-struct pattern not found; leaving generic.c unchanged"; exit 0 }
+          $nl = if ($src.Contains("`r`n")) { "`r`n" } else { "`n" }
+          $fixed = $rx.Replace($src, { param($m) $m.Groups[1].Value + $m.Groups[2].Value + "`tchar  msvc_placeholder;  /* MSVC C rejects empty structs (C2016) */" + $nl + $m.Groups[3].Value }, 1)
+          [IO.File]::WriteAllText($f, $fixed)
+          Write-Host "patched ${f}:"
+          Select-String -Path $f -Pattern 'avro_generic_record \{' -Context 0,4 | ForEach-Object { $_.Line; $_.Context.PostContext }
 
       - name: Build the CLI
         timeout-minutes: ${{ inputs.variant == 'fat' && 300 || 150 }}
