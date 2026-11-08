@@ -64,17 +64,12 @@ jobs:
 
       # duckdb-iceberg ships test data with paths beyond Windows' 260-char
       # default; git refuses to write them unless long paths are enabled.
-      # The runner's git converts LF to CRLF on checkout. Extensions fetched
-      # by CMake then carry CRLF vcpkg patches, and a blank context line
-      # becomes a lone CR that git apply rejects as "corrupt patch" (seen with
-      # duckdb-aws's aws-c-io patch at v2.0.0). Must run before any checkout.
-      - name: Configure git (long paths, no CRLF conversion)
+      # Leave core.autocrlf at the runner default (true): with it off, DuckDB's
+      # own avro patch trips an assertion in Strawberry's patch.exe 2.5.9.
+      # The vcpkg overlay patches are fixed separately after the manifest merge.
+      - name: Configure git (long paths)
         shell: pwsh
-        run: |
-          git config --system core.longpaths true
-          git config --system core.autocrlf false
-          git config --global core.autocrlf false
-          git config --show-origin --get-all core.autocrlf
+        run: git config --system core.longpaths true
 
       - name: Check out DuckDB source at the requested tag
         uses: actions/checkout@v4
@@ -149,6 +144,29 @@ jobs:
           cmake --build . --config Release
           Get-ChildItem
 
+      # The runner's git checks extensions out with CRLF. vcpkg applies an
+      # overlay port's patches with git apply against LF source tarballs, and
+      # a blank context line in a CRLF patch becomes a lone CR that git apply
+      # rejects as "corrupt patch" (duckdb-aws's aws-c-io patch at v2.0.0,
+      # which applies cleanly as LF). Convert those patch files back to LF.
+      - name: Normalise vcpkg overlay patches to LF
+        shell: pwsh
+        run: |
+          $n = 0
+          Get-ChildItem build/extension_configuration/_deps -Recurse -Filter *.patch -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '[\\/]vcpkg_ports[\\/]' } |
+            ForEach-Object {
+              $bytes = [IO.File]::ReadAllBytes($_.FullName)
+              $latin1 = [Text.Encoding]::GetEncoding(28591)   # byte-transparent
+              $text = $latin1.GetString($bytes)
+              if ($text.Contains("`r`n")) {
+                [IO.File]::WriteAllBytes($_.FullName, $latin1.GetBytes($text.Replace("`r`n", "`n")))
+                Write-Host "LF: $($_.FullName)"
+                $n++
+              }
+            }
+          Write-Host "$n patch file(s) converted"
+
       # Phase 2: real configure. vcpkg (preinstalled on the runner) installs the
       # merged dependencies in manifest mode; on a cold cache this is the long part.
       - name: Configure
@@ -184,8 +202,8 @@ jobs:
             if (-not (Test-Path $src)) { continue }   # in-tree extension
             $inc = Join-Path $src "src/include"
             $want = Join-Path $inc "${ext}_extension.hpp"
-            if (Test-Path $want) { Write-Host "== $ext: ${ext}_extension.hpp present"; continue }
-            Write-Host "== $ext: no ${ext}_extension.hpp; headers found:"
+            if (Test-Path $want) { Write-Host "== ${ext}: ${ext}_extension.hpp present"; continue }
+            Write-Host "== ${ext}: no ${ext}_extension.hpp; headers found:"
             Get-ChildItem -Path $src -Recurse -Filter *extension*.hpp | ForEach-Object { "   " + $_.FullName }
             $alt = Get-ChildItem -Path $src -Recurse -Filter "${ext}-extension.hpp" | Select-Object -First 1
             if ($alt) {
