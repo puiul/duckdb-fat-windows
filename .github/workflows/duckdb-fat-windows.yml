@@ -64,6 +64,10 @@ jobs:
           $exts = "${{ inputs.extensions }}".Trim()
           if (-not $exts) { $exts = if ("${{ inputs.variant }}" -eq 'fat') { $fat } else { $chubby } }
           "EXTS=$exts" >> $env:GITHUB_ENV
+          # DuckDB 2.0 no longer reads the version from git describe: without
+          # DUCKDB_VERSION a source build reports vX.Y.0-dev<commit count>.
+          $ref = "${{ inputs.duckdb_ref }}"
+          if ($ref -match '^v\d+\.\d+\.\d+$') { "DUCKDB_VERSION=$ref" >> $env:GITHUB_ENV; Write-Host "DUCKDB_VERSION=$ref" }
           Write-Host "variant=${{ inputs.variant }} duckdb_ref=${{ inputs.duckdb_ref }}"
           Write-Host "extensions=$exts"
 
@@ -191,16 +195,19 @@ jobs:
             }
           Write-Host "$n patch file(s) converted"
 
-      # Phase 2: real configure. vcpkg (preinstalled on the runner) installs the
-      # merged dependencies in manifest mode; on a cold cache this is the long part.
+      # Phase 2: real configure. vcpkg installs the merged dependencies in
+      # manifest mode; on a cold cache this is the long part.
+      # DuckDB 2.0 changes: BUILD_EXTENSIONS only builds an extension; it is
+      # linked only when named in STATICALLY_LINK_EXTENSIONS (DONT_LINK is gone).
+      # The lock is ENABLE_EXTENSION_LOAD=OFF, which leaves the loader library
+      # out of the link (DISABLE_EXTENSION_LOAD is a deprecated alias).
       - name: Configure
         timeout-minutes: ${{ inputs.variant == 'fat' && 300 || 150 }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force build/release | Out-Null
           Set-Location build/release
-          $lock = @()
-          if ("${{ inputs.variant }}" -eq 'chubby') { $lock = @('-DDISABLE_EXTENSION_LOAD=TRUE') }
+          $load = if ("${{ inputs.variant }}" -eq 'chubby') { 'OFF' } else { 'ON' }
           cmake -DCMAKE_BUILD_TYPE=Release `
                 -DCMAKE_GENERATOR_PLATFORM=x64 `
                 -DBUILD_SHELL=TRUE `
@@ -208,14 +215,26 @@ jobs:
                 -DBUILD_BENCHMARKS=FALSE `
                 -DEXTENSION_STATIC_BUILD=TRUE `
                 -DENABLE_EXTENSION_AUTOLOADING=1 `
-                @lock `
+                -DENABLE_EXTENSION_LOAD=$load `
                 -DBUILD_COMPLETE_EXTENSION_SET=${{ inputs.variant == 'fat' && 'TRUE' || 'FALSE' }} `
                 -DBUILD_EXTENSIONS="$env:EXTS" `
+                -DSTATICALLY_LINK_EXTENSIONS="$env:EXTS" `
                 -DVCPKG_MANIFEST_DIR="$env:GITHUB_WORKSPACE/build/extension_configuration" `
                 -DVCPKG_TARGET_TRIPLET=x64-windows-static `
                 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-                ../..
-
+                ../.. 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/configure.log"
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed (exit $LASTEXITCODE)" }
+          # Fail now, not hours later, if any requested extension would be left out.
+          $log = Get-Content "$env:GITHUB_WORKSPACE/configure.log" -Raw
+          $m = [regex]::Match($log, 'Extensions built but not linked: \[([^\]]*)\]')
+          if ($m.Success) {
+            $notLinked = $m.Groups[1].Value.Split(',').Trim() | Where-Object { $_ }
+            $wanted = $env:EXTS.Split(';', [StringSplitOptions]::RemoveEmptyEntries)
+            $bad = $notLinked | Where-Object { $_ -in $wanted }
+            if ($bad) { throw "requested but not linked: $($bad -join ', ')" }
+          }
+          $linked = [regex]::Match($log, 'Linked into DuckDB: extensions \[([^\]]*)\]').Groups[1].Value
+          Write-Host "Linked into DuckDB: [$linked]"
       # The generated extension loader includes <name>_extension.hpp. List what
       # each extension ships and shim the expected name if it differs.
       - name: Inspect and shim extension headers
@@ -264,8 +283,8 @@ jobs:
           & dist/duckdb.exe --version
           Write-Host "`n== SELECT 1"
           & dist/duckdb.exe -c "SELECT 1"
-          Write-Host "`n== loaded extensions"
-          & dist/duckdb.exe -c "SELECT extension_name, install_mode FROM duckdb_extensions() WHERE loaded ORDER BY extension_name"
+          Write-Host "`n== extensions (all rows)"
+          & dist/duckdb.exe -c "SELECT extension_name, loaded, installed, install_mode FROM duckdb_extensions() ORDER BY install_mode, extension_name"
 
       # Inputs for a Black Duck / SCA review: vcpkg's per-port SPDX files,
       # the pinned commit of every out-of-tree extension, and the Cargo.lock

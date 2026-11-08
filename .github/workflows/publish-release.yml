@@ -78,8 +78,15 @@ jobs:
 
           $version = (& $exe --version 2>&1) -join "`n"
           if ($LASTEXITCODE -ne 0) { throw "--version failed (exit $LASTEXITCODE): $version" }
+          if ($version -notmatch "^${{ inputs.duckdb_ref }}\s" -or $version -match 'Development|-dev\d') {
+            throw "version '$version' is not the release ${{ inputs.duckdb_ref }}"
+          }
 
-          $linked = & $exe -csv -noheader -c "SELECT extension_name FROM duckdb_extensions() WHERE loaded AND install_mode = 'STATICALLY_LINKED' ORDER BY 1" 2>&1
+          # DuckDB 2.0 loads linked extensions at startup only when they register;
+          # judge linking by install_mode, and report loaded state separately.
+          $all = (& $exe -csv -c "SELECT extension_name, loaded, install_mode FROM duckdb_extensions() WHERE install_mode = 'STATICALLY_LINKED' ORDER BY 1" 2>&1) -join "`n"
+          Note 'linked extensions (name,loaded,mode)' $all
+          $linked = & $exe -csv -noheader -c "SELECT extension_name FROM duckdb_extensions() WHERE install_mode = 'STATICALLY_LINKED' ORDER BY 1" 2>&1
           if ($LASTEXITCODE -ne 0) { throw "linked-extension query failed: $($linked -join ' ')" }
           $missing = $expected | Where-Object { $_ -notin $linked }
           if ($missing) { throw "Not statically linked: $($missing -join ', '). Linked: $($linked -join ', ')" }
@@ -127,9 +134,10 @@ jobs:
             foreach ($stmt in @('INSTALL ui', 'LOAD ui', 'INSTALL json')) {
               $out = (& $exe -c $stmt 2>&1) -join ' '
               $code = $LASTEXITCODE
-              if ($code -eq 0 -or $out -notmatch 'compile time flag') { throw "'$stmt' was not refused by the compile-time flag (exit $code): $out" }
+              # 1.5: "disabled through a compile time flag"; 2.0: no loader library linked
+              if ($code -eq 0 -or $out -notmatch 'compile time flag|does not link the loadable_extensions library') { throw "'$stmt' was not refused (exit $code): $out" }
             }
-            Note 'locked' 'INSTALL ui, LOAD ui, INSTALL json all refused by the compile-time flag'
+            Note 'locked' "INSTALL ui, LOAD ui, INSTALL json all refused; last: $out"
           }
           $found = if (Test-Path $extdir) { Get-ChildItem -Recurse -Force $extdir -Filter '*.duckdb_extension*' -ErrorAction SilentlyContinue }
           if ($found) { throw "extension files were written: $(($found | ForEach-Object { $_.FullName }) -join ', ')" }
