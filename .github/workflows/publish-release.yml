@@ -113,8 +113,8 @@ jobs:
           $out = (& $exe -csv -noheader -c "ATTACH 'ducklake:meta.ducklake' AS l2 (DATA_PATH 'l2_files/'); CREATE TABLE l2.t AS SELECT 42 AS x; SELECT x FROM l2.t;" 2>&1) -join ' '
           if ($LASTEXITCODE -ne 0 -or $out.Trim() -ne '42') { throw "ducklake+duckdb gave '$out', expected 42" }
 
-          # Excel round trip.
-          $out = (& $exe -csv -noheader -c "COPY (SELECT 1 AS a, 'x' AS b) TO 'rt.xlsx' WITH (FORMAT xlsx, HEADER true); SELECT a, b FROM read_xlsx('rt.xlsx');" 2>&1) -join ' '
+          # Excel round trip. xlsx stores numbers as doubles, so read_xlsx returns 1.0.
+          $out = (& $exe -csv -noheader -c "COPY (SELECT 1 AS a, 'x' AS b) TO 'rt.xlsx' WITH (FORMAT xlsx, HEADER true); SELECT a::INTEGER, b FROM read_xlsx('rt.xlsx');" 2>&1) -join ' '
           if ($LASTEXITCODE -ne 0 -or $out.Trim() -ne '1,x') { throw "excel round trip gave '$out', expected 1,x" }
 
           # HTTPS read (static OpenSSL/libcurl, no CA bundle configured).
