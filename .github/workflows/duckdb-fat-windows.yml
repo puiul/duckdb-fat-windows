@@ -54,6 +54,30 @@ jobs:
     timeout-minutes: ${{ inputs.variant == 'fat' && 360 || 180 }}
 
     steps:
+      # C: ships nearly full on the hosted Windows image and D: has ~100 GB
+      # free. Fat run 42502120243 died with C: full: the Rust link failed with
+      # LNK1108 in %TEMP% and CL.exe with "not enough space on the disk".
+      # Keep scratch off C: and remove preinstalled toolchains nothing here
+      # uses (Python stays for DuckDB's scripts, Strawberry for patch.exe).
+      - name: Free disk on C, move scratch to D
+        shell: pwsh
+        run: |
+          function Free { Get-PSDrive -PSProvider FileSystem | Where-Object Name -in 'C','D' | ForEach-Object { "{0}: {1:N1} GB free" -f $_.Name, ($_.Free/1GB) } }
+          Write-Host "before:"; Free
+          $dirs = @('C:\Android', 'C:\hostedtoolcache\windows\CodeQL', 'C:\hostedtoolcache\windows\go',
+                    'C:\hostedtoolcache\windows\Ruby', 'C:\hostedtoolcache\windows\PyPy',
+                    'C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk')
+          foreach ($d in $dirs) {
+            if (Test-Path $d) { $t = Measure-Command { cmd /c "rmdir /s /q `"$d`"" }; Write-Host ("removed {0} ({1:N0}s)" -f $d, $t.TotalSeconds) }
+          }
+          Write-Host "after:"; Free
+          $scratch = 'D:\scratch'
+          foreach ($s in 'tmp','cargo-home','vcpkg-buildtrees','vcpkg-packages') { New-Item -ItemType Directory -Force (Join-Path $scratch $s) | Out-Null }
+          "TEMP=$scratch\tmp" >> $env:GITHUB_ENV
+          "TMP=$scratch\tmp" >> $env:GITHUB_ENV
+          "CARGO_HOME=$scratch\cargo-home" >> $env:GITHUB_ENV
+          "VCPKG_SCRATCH=$scratch" >> $env:GITHUB_ENV
+
       # Extension order matters: an extension whose dependency is not linked
       # yet triggers autoload at startup, and then every invocation dies
       # (avro before iceberg, delta before unity_catalog, aws before glue).
@@ -221,6 +245,7 @@ jobs:
                 -DSTATICALLY_LINK_EXTENSIONS="$env:EXTS" `
                 -DVCPKG_MANIFEST_DIR="$env:GITHUB_WORKSPACE/build/extension_configuration" `
                 -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+                "-DVCPKG_INSTALL_OPTIONS=--x-buildtrees-root=$env:VCPKG_SCRATCH\vcpkg-buildtrees;--x-packages-root=$env:VCPKG_SCRATCH\vcpkg-packages;--clean-after-build" `
                 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
                 ../.. 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/configure.log"
           if ($LASTEXITCODE -ne 0) { throw "cmake configure failed (exit $LASTEXITCODE)" }
@@ -233,6 +258,7 @@ jobs:
             $bad = $notLinked | Where-Object { $_ -in $wanted }
             if ($bad) { throw "requested but not linked: $($bad -join ', ')" }
           }
+          Get-PSDrive -PSProvider FileSystem | Where-Object Name -in 'C','D' | ForEach-Object { "{0}: {1:N1} GB free after configure" -f $_.Name, ($_.Free/1GB) }
           $linked = [regex]::Match($log, 'Linked into DuckDB: extensions \[([^\]]*)\]').Groups[1].Value
           Write-Host "Linked into DuckDB: [$linked]"
           # The last "Linked into DuckDB" line is the real configure (the first
