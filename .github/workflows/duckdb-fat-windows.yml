@@ -62,18 +62,26 @@ jobs:
           Write-Host "variant=${{ inputs.variant }} duckdb_ref=${{ inputs.duckdb_ref }}"
           Write-Host "extensions=$exts"
 
+      # duckdb-iceberg ships test data with paths beyond Windows' 260-char
+      # default; git refuses to write them unless long paths are enabled.
+      # The runner's git converts LF to CRLF on checkout. Extensions fetched
+      # by CMake then carry CRLF vcpkg patches, and a blank context line
+      # becomes a lone CR that git apply rejects as "corrupt patch" (seen with
+      # duckdb-aws's aws-c-io patch at v2.0.0). Must run before any checkout.
+      - name: Configure git (long paths, no CRLF conversion)
+        shell: pwsh
+        run: |
+          git config --system core.longpaths true
+          git config --system core.autocrlf false
+          git config --global core.autocrlf false
+          git config --show-origin --get-all core.autocrlf
+
       - name: Check out DuckDB source at the requested tag
         uses: actions/checkout@v4
         with:
           repository: duckdb/duckdb
           ref: ${{ inputs.duckdb_ref }}
           fetch-depth: 0   # git describe needs the tags
-
-      # duckdb-iceberg ships test data with paths beyond Windows' 260-char
-      # default; git refuses to write them unless long paths are enabled.
-      - name: Enable long paths for git
-        shell: pwsh
-        run: git config --system core.longpaths true
 
       - name: Rust toolchain report
         if: inputs.variant == 'fat'
